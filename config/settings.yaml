@@ -1,0 +1,41 @@
+
+database:
+  host: localhost
+  port: 27017
+  name: research_tracker
+  
+  collections:
+    experiments: experiments
+    datasets: datasets
+    results: results
+
+api:
+  host: 0.0.0.0
+  port: 5000
+  debug: true
+  
+export:
+  default_format: json
+  output_directory: exports
+  supported_formats:
+    - json
+    - csv
+    - xlsx
+  
+  csv:
+    delimiter: ","
+    encoding: utf-8
+    
+  xlsx:
+    sheet_name: Experiments
+
+logging:
+  level: INFO
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: research_tracker.log
+
+app:
+  name: Research Experiment Tracker
+  version: 1.0.0
+  author: Kamel
+  description: A tool for PhD researchers to manage experiments
