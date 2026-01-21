@@ -1,19 +1,33 @@
+# Research Experiment Tracker Configuration
+# This file demonstrates YAML file handling (Part 3)
 
+# Database Configuration
 database:
+  # MongoDB connection settings
   host: localhost
   port: 27017
   name: research_tracker
   
+  # Authentication credentials (for Docker setup)
+  username: researcher
+  password: researcher123
+  
+  # Alternative: Full connection string (uncomment to use instead)
+  # connection_string: mongodb://researcher:researcher123@localhost:27017/research_tracker
+  
+  # Collection names
   collections:
     experiments: experiments
     datasets: datasets
     results: results
 
+# API Configuration
 api:
   host: 0.0.0.0
   port: 5000
   debug: true
   
+# Export Settings
 export:
   default_format: json
   output_directory: exports
@@ -22,18 +36,22 @@ export:
     - csv
     - xlsx
   
+  # CSV settings
   csv:
     delimiter: ","
     encoding: utf-8
     
+  # Excel settings
   xlsx:
     sheet_name: Experiments
 
+# Logging Configuration
 logging:
   level: INFO
   format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
   file: research_tracker.log
 
+# Application Metadata
 app:
   name: Research Experiment Tracker
   version: 1.0.0

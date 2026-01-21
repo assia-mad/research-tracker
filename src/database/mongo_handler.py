@@ -30,14 +30,26 @@ class MongoHandler:
         host: str = "localhost",
         port: int = 27017,
         database: str = "research_tracker",
+        username: Optional[str] = None,
+        password: Optional[str] = None,
         connection_string: Optional[str] = None,
     ):
         """
         Initialize MongoDB connection.
+
+        Args:
+            host: MongoDB host address
+            port: MongoDB port number
+            database: Database name
+            username: MongoDB username for authentication
+            password: MongoDB password for authentication
+            connection_string: Optional full connection string (overrides other params)
         """
         self._host = host
         self._port = port
         self._database_name = database
+        self._username = username
+        self._password = password
         self._connection_string = connection_string
 
         self._client: Optional[MongoClient] = None
@@ -61,8 +73,22 @@ class MongoHandler:
 
         try:
             if self._connection_string:
-                self._client = MongoClient(self._connection_string)
+                # Use full connection string if provided
+                self._client = MongoClient(
+                    self._connection_string, serverSelectionTimeoutMS=5000
+                )
+            elif self._username and self._password:
+                # Use authentication credentials
+                self._client = MongoClient(
+                    host=self._host,
+                    port=self._port,
+                    username=self._username,
+                    password=self._password,
+                    authSource=self._database_name,
+                    serverSelectionTimeoutMS=5000,
+                )
             else:
+                # Connect without authentication
                 self._client = MongoClient(
                     host=self._host, port=self._port, serverSelectionTimeoutMS=5000
                 )
@@ -301,6 +327,21 @@ class MongoHandler:
             logger.error(f"Failed to find datasets: {e}")
             return []
 
+    def update_dataset(self, dataset_id: str, updates: Dict[str, Any]) -> bool:
+        """Update a dataset."""
+        if not self._connected:
+            return False
+
+        try:
+            updates["updated_at"] = datetime.now().isoformat()
+            result = self._db.datasets.update_one(
+                {"_id": dataset_id}, {"$set": updates}
+            )
+            return result.modified_count > 0
+        except PyMongoError as e:
+            logger.error(f"Failed to update dataset: {e}")
+            return False
+
     def delete_dataset(self, dataset_id: str) -> bool:
         """Delete a dataset."""
         if not self._connected:
@@ -328,6 +369,20 @@ class MongoHandler:
             logger.error(f"Failed to insert result: {e}")
             return None
 
+    def find_result(self, result_id: str) -> Optional[Result]:
+        """Find a result by ID."""
+        if not self._connected:
+            return None
+
+        try:
+            doc = self._db.results.find_one({"_id": result_id})
+            if doc:
+                return Result.from_dict(doc)
+            return None
+        except PyMongoError as e:
+            logger.error(f"Failed to find result: {e}")
+            return None
+
     def find_results_for_experiment(self, experiment_id: str) -> List[Result]:
         """Find all results for an experiment."""
         if not self._connected:
@@ -341,6 +396,30 @@ class MongoHandler:
         except PyMongoError as e:
             logger.error(f"Failed to find results: {e}")
             return []
+
+    def delete_result(self, result_id: str) -> bool:
+        """Delete a result."""
+        if not self._connected:
+            return False
+
+        try:
+            result = self._db.results.delete_one({"_id": result_id})
+            return result.deleted_count > 0
+        except PyMongoError as e:
+            logger.error(f"Failed to delete result: {e}")
+            return False
+
+    def delete_results_for_experiment(self, experiment_id: str) -> int:
+        """Delete all results for an experiment."""
+        if not self._connected:
+            return 0
+
+        try:
+            result = self._db.results.delete_many({"experiment_id": experiment_id})
+            return result.deleted_count
+        except PyMongoError as e:
+            logger.error(f"Failed to delete results: {e}")
+            return 0
 
     # ==================== UTILITY METHODS ====================
 
@@ -376,6 +455,24 @@ class MongoHandler:
             logger.error(f"Failed to clear collections: {e}")
             return False
 
+    def health_check(self) -> Dict[str, Any]:
+        """Perform a health check on the database connection."""
+        if not self._connected:
+            return {"status": "disconnected", "message": "Not connected to MongoDB"}
+
+        try:
+            # Ping the database
+            self._client.admin.command("ping")
+
+            return {
+                "status": "healthy",
+                "database": self._database_name,
+                "host": self._host,
+                "port": self._port,
+            }
+        except PyMongoError as e:
+            return {"status": "unhealthy", "message": str(e)}
+
     def __enter__(self):
         """Context manager entry."""
         return self
@@ -383,3 +480,8 @@ class MongoHandler:
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager exit."""
         self.close()
+
+    def __repr__(self) -> str:
+        """String representation."""
+        status = "connected" if self._connected else "disconnected"
+        return f"MongoHandler(database='{self._database_name}', status='{status}')"

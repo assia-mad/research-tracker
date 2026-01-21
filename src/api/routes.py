@@ -6,7 +6,9 @@ from flask import Blueprint, Flask, jsonify, request, send_file
 
 from ..database.file_handler import FileHandler
 from ..database.mongo_handler import MongoHandler
+from ..models.dataset import Dataset, DatasetFormat
 from ..models.experiment import Experiment, ExperimentStatus
+from ..models.result import Result
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -22,6 +24,12 @@ file_handler: Optional[FileHandler] = None
 def create_app(config: dict = None) -> Flask:
     """
     Create and configure the Flask application.
+
+    Args:
+        config: Optional configuration dictionary
+
+    Returns:
+        Flask: Configured Flask application
     """
     global db_handler, file_handler
 
@@ -34,19 +42,20 @@ def create_app(config: dict = None) -> Flask:
     if config:
         app.config.update(config)
 
-    # Initialize handlers
+    # Initialize database handler with authentication support
     db_config = config.get("database", {}) if config else {}
     db_handler = MongoHandler(
         host=db_config.get("host", "localhost"),
         port=db_config.get("port", 27017),
         database=db_config.get("name", "research_tracker"),
+        username=db_config.get("username"),
+        password=db_config.get("password"),
+        connection_string=db_config.get("connection_string"),
     )
 
-    export_dir = (
-        config.get("export", {}).get("output_directory", "exports")
-        if config
-        else "exports"
-    )
+    # Initialize file handler
+    export_config = config.get("export", {}) if config else {}
+    export_dir = export_config.get("output_directory", "exports")
     file_handler = FileHandler(output_dir=export_dir)
 
     # Register blueprint
@@ -54,6 +63,22 @@ def create_app(config: dict = None) -> Flask:
 
     # Register error handlers
     register_error_handlers(app)
+
+    # Register root route
+    @app.route("/")
+    def index():
+        return jsonify(
+            {
+                "name": "Research Experiment Tracker API",
+                "version": "1.0.0",
+                "endpoints": {
+                    "health": "/api/health",
+                    "stats": "/api/stats",
+                    "experiments": "/api/experiments",
+                    "datasets": "/api/datasets",
+                },
+            }
+        )
 
     logger.info("Flask application created successfully")
     return app
@@ -88,11 +113,14 @@ def register_error_handlers(app: Flask) -> None:
 @api_bp.route("/health", methods=["GET"])
 def health_check():
     """Health check endpoint."""
+    db_health = db_handler.health_check() if db_handler else {"status": "unknown"}
+
     return jsonify(
         {
             "status": "healthy",
             "service": "Research Experiment Tracker API",
             "version": "1.0.0",
+            "database": db_health,
         }
     )
 
@@ -115,8 +143,8 @@ def list_experiments():
     List all experiments.
 
     Query Parameters:
-        - status: Filter by status
-        - author: Filter by author
+        - status: Filter by status (planned, running, completed, failed, paused)
+        - author: Filter by author name
         - limit: Maximum number of results (default: 100)
         - sort: Sort field (default: created_at)
         - order: Sort order (asc/desc, default: desc)
@@ -167,7 +195,11 @@ def get_experiment(experiment_id: str):
     if db_handler:
         experiment = db_handler.find_experiment(experiment_id)
         if experiment:
-            return jsonify(experiment.to_dict())
+            # Also get associated results
+            results = db_handler.find_results_for_experiment(experiment_id)
+            exp_dict = experiment.to_dict()
+            exp_dict["results"] = [r.to_dict() for r in results]
+            return jsonify(exp_dict)
 
     return jsonify(
         {"error": "Not Found", "message": f"Experiment {experiment_id} not found"}
@@ -288,6 +320,16 @@ def delete_experiment(experiment_id: str):
         Success message
     """
     if db_handler:
+        # Check if experiment exists
+        experiment = db_handler.find_experiment(experiment_id)
+        if not experiment:
+            return jsonify(
+                {
+                    "error": "Not Found",
+                    "message": f"Experiment {experiment_id} not found",
+                }
+            ), 404
+
         success = db_handler.delete_experiment(experiment_id)
         if success:
             return jsonify(
@@ -295,8 +337,75 @@ def delete_experiment(experiment_id: str):
             )
 
     return jsonify(
-        {"error": "Not Found", "message": f"Experiment {experiment_id} not found"}
-    ), 404
+        {"error": "Delete Failed", "message": "Could not delete experiment"}
+    ), 500
+
+
+# ==================== EXPERIMENT ACTIONS ====================
+
+
+@api_bp.route("/experiments/<experiment_id>/start", methods=["POST"])
+def start_experiment(experiment_id: str):
+    """Mark an experiment as running."""
+    if db_handler:
+        experiment = db_handler.find_experiment(experiment_id)
+        if not experiment:
+            return jsonify({"error": "Not Found"}), 404
+
+        success = db_handler.update_experiment(
+            experiment_id, {"status": ExperimentStatus.RUNNING.value}
+        )
+        if success:
+            updated = db_handler.find_experiment(experiment_id)
+            return jsonify(updated.to_dict())
+
+    return jsonify({"error": "Update Failed"}), 500
+
+
+@api_bp.route("/experiments/<experiment_id>/complete", methods=["POST"])
+def complete_experiment(experiment_id: str):
+    """Mark an experiment as completed with optional metrics."""
+    data = request.get_json() or {}
+
+    if db_handler:
+        experiment = db_handler.find_experiment(experiment_id)
+        if not experiment:
+            return jsonify({"error": "Not Found"}), 404
+
+        updates = {"status": ExperimentStatus.COMPLETED.value}
+        if "metrics" in data:
+            updates["metrics"] = data["metrics"]
+
+        success = db_handler.update_experiment(experiment_id, updates)
+        if success:
+            updated = db_handler.find_experiment(experiment_id)
+            return jsonify(updated.to_dict())
+
+    return jsonify({"error": "Update Failed"}), 500
+
+
+@api_bp.route("/experiments/<experiment_id>/fail", methods=["POST"])
+def fail_experiment(experiment_id: str):
+    """Mark an experiment as failed with optional error message."""
+    data = request.get_json() or {}
+
+    if db_handler:
+        experiment = db_handler.find_experiment(experiment_id)
+        if not experiment:
+            return jsonify({"error": "Not Found"}), 404
+
+        updates = {"status": ExperimentStatus.FAILED.value}
+        if "error" in data:
+            metrics = experiment.metrics
+            metrics["error"] = data["error"]
+            updates["metrics"] = metrics
+
+        success = db_handler.update_experiment(experiment_id, updates)
+        if success:
+            updated = db_handler.find_experiment(experiment_id)
+            return jsonify(updated.to_dict())
+
+    return jsonify({"error": "Update Failed"}), 500
 
 
 # ==================== EXPORT ROUTES ====================
@@ -321,10 +430,20 @@ def export_experiments(format_type: str):
             }
         ), 400
 
+    # Get filter parameters
+    status = request.args.get("status")
+    author = request.args.get("author")
+
+    query = {}
+    if status:
+        query["status"] = status
+    if author:
+        query["author"] = author
+
     # Get experiments
     experiments = []
     if db_handler:
-        experiments = db_handler.find_experiments(limit=1000)
+        experiments = db_handler.find_experiments(query=query, limit=1000)
 
     if not experiments:
         return jsonify({"error": "No Data", "message": "No experiments to export"}), 404
@@ -352,42 +471,179 @@ def export_experiments(format_type: str):
         return jsonify({"error": "Export Failed", "message": str(e)}), 500
 
 
-# ==================== EXPERIMENT ACTIONS ====================
+# ==================== DATASET ROUTES ====================
 
 
-@api_bp.route("/experiments/<experiment_id>/start", methods=["POST"])
-def start_experiment(experiment_id: str):
-    """Mark an experiment as running."""
+@api_bp.route("/datasets", methods=["GET"])
+def list_datasets():
+    """List all datasets."""
+    limit = request.args.get("limit", 100, type=int)
+
     if db_handler:
-        success = db_handler.update_experiment(
-            experiment_id, {"status": ExperimentStatus.RUNNING.value}
+        datasets = db_handler.find_datasets(limit=limit)
+        return jsonify(
+            {"datasets": [ds.to_dict() for ds in datasets], "count": len(datasets)}
         )
-        if success:
-            experiment = db_handler.find_experiment(experiment_id)
-            return jsonify(experiment.to_dict())
 
-    return jsonify({"error": "Not Found"}), 404
+    return jsonify({"datasets": [], "count": 0})
 
 
-@api_bp.route("/experiments/<experiment_id>/complete", methods=["POST"])
-def complete_experiment(experiment_id: str):
-    """Mark an experiment as completed with optional metrics."""
-    data = request.get_json() or {}
+@api_bp.route("/datasets/<dataset_id>", methods=["GET"])
+def get_dataset(dataset_id: str):
+    """Get a specific dataset by ID."""
+    if db_handler:
+        dataset = db_handler.find_dataset(dataset_id)
+        if dataset:
+            return jsonify(dataset.to_dict())
+
+    return jsonify(
+        {"error": "Not Found", "message": f"Dataset {dataset_id} not found"}
+    ), 404
+
+
+@api_bp.route("/datasets", methods=["POST"])
+def create_dataset():
+    """Create a new dataset."""
+    data = request.get_json()
+
+    if not data:
+        return jsonify(
+            {"error": "Bad Request", "message": "Request body must be JSON"}
+        ), 400
+
+    if "name" not in data:
+        return jsonify(
+            {"error": "Bad Request", "message": "Dataset name is required"}
+        ), 400
+
+    try:
+        dataset = Dataset(
+            name=data["name"],
+            description=data.get("description", ""),
+            source=data.get("source", ""),
+            format=data.get("format", "csv"),
+            size_mb=data.get("size_mb", 0.0),
+            num_samples=data.get("num_samples", 0),
+            features=data.get("features", []),
+            path=data.get("path", ""),
+            metadata=data.get("metadata", {}),
+        )
+
+        if db_handler:
+            ds_id = db_handler.insert_dataset(dataset)
+            if ds_id:
+                logger.info(f"Created dataset: {ds_id}")
+                return jsonify(dataset.to_dict()), 201
+
+        return jsonify(dataset.to_dict()), 201
+
+    except ValueError as e:
+        return jsonify({"error": "Validation Error", "message": str(e)}), 400
+
+
+@api_bp.route("/datasets/<dataset_id>", methods=["PUT"])
+def update_dataset(dataset_id: str):
+    """Update a dataset."""
+    data = request.get_json()
+
+    if not data:
+        return jsonify(
+            {"error": "Bad Request", "message": "Request body must be JSON"}
+        ), 400
 
     if db_handler:
-        updates = {"status": ExperimentStatus.COMPLETED.value}
-        if "metrics" in data:
-            updates["metrics"] = data["metrics"]
+        dataset = db_handler.find_dataset(dataset_id)
+        if not dataset:
+            return jsonify(
+                {"error": "Not Found", "message": f"Dataset {dataset_id} not found"}
+            ), 404
 
-        success = db_handler.update_experiment(experiment_id, updates)
+        success = db_handler.update_dataset(dataset_id, data)
         if success:
-            experiment = db_handler.find_experiment(experiment_id)
-            return jsonify(experiment.to_dict())
+            updated = db_handler.find_dataset(dataset_id)
+            return jsonify(updated.to_dict())
 
-    return jsonify({"error": "Not Found"}), 404
+    return jsonify({"error": "Update Failed"}), 500
 
 
-# Convenience function for running the API
+@api_bp.route("/datasets/<dataset_id>", methods=["DELETE"])
+def delete_dataset(dataset_id: str):
+    """Delete a dataset."""
+    if db_handler:
+        dataset = db_handler.find_dataset(dataset_id)
+        if not dataset:
+            return jsonify(
+                {"error": "Not Found", "message": f"Dataset {dataset_id} not found"}
+            ), 404
+
+        success = db_handler.delete_dataset(dataset_id)
+        if success:
+            return jsonify({"message": f"Dataset {dataset_id} deleted successfully"})
+
+    return jsonify({"error": "Delete Failed"}), 500
+
+
+# ==================== RESULT ROUTES ====================
+
+
+@api_bp.route("/experiments/<experiment_id>/results", methods=["GET"])
+def list_results(experiment_id: str):
+    """List all results for an experiment."""
+    if db_handler:
+        results = db_handler.find_results_for_experiment(experiment_id)
+        return jsonify(
+            {"results": [r.to_dict() for r in results], "count": len(results)}
+        )
+
+    return jsonify({"results": [], "count": 0})
+
+
+@api_bp.route("/experiments/<experiment_id>/results", methods=["POST"])
+def create_result(experiment_id: str):
+    """Create a new result for an experiment."""
+    data = request.get_json()
+
+    if not data:
+        return jsonify(
+            {"error": "Bad Request", "message": "Request body must be JSON"}
+        ), 400
+
+    # Verify experiment exists
+    if db_handler:
+        experiment = db_handler.find_experiment(experiment_id)
+        if not experiment:
+            return jsonify(
+                {
+                    "error": "Not Found",
+                    "message": f"Experiment {experiment_id} not found",
+                }
+            ), 404
+
+    try:
+        result = Result(
+            experiment_id=experiment_id,
+            run_number=data.get("run_number", 1),
+            metrics=data.get("metrics", {}),
+            artifacts=data.get("artifacts", []),
+            notes=data.get("notes", ""),
+            duration_seconds=data.get("duration_seconds", 0.0),
+        )
+
+        if db_handler:
+            result_id = db_handler.insert_result(result)
+            if result_id:
+                logger.info(f"Created result: {result_id}")
+                return jsonify(result.to_dict()), 201
+
+        return jsonify(result.to_dict()), 201
+
+    except ValueError as e:
+        return jsonify({"error": "Validation Error", "message": str(e)}), 400
+
+
+# ==================== UTILITY FUNCTIONS ====================
+
+
 def run_api(host: str = "0.0.0.0", port: int = 5000, debug: bool = True):
     """Run the Flask API server."""
     app = create_app()
